@@ -1,0 +1,56 @@
+# CalDAV Server Configuration
+# All values shown are the defaults unless noted otherwise.
+
+# Address the server listens on. Use ":8080" for all interfaces on port 8080.
+listen_addr: ":8080"
+
+# Base URL path prefix. Set to "/caldav" if reverse-proxying under a subpath.
+base_path: "/"
+
+# Path to the SQLite database file.
+db_path: "./caldav.db"
+
+# Logging level: debug, info, warn, error
+log_level: "info"
+
+# TLS configuration
+tls:
+  # Set to true to enable TLS.
+  enabled: false
+
+  # When true, certificates are obtained automatically via ACME (Let's Encrypt).
+  auto_cert: false
+
+  # Manual certificate paths (ignored when auto_cert is true).
+  cert_file: ""
+  key_file: ""
+
+  # Hostname for ACME certificate requests. Required when auto_cert is true.
+  acme_host: ""
+
+  # Directory to cache ACME certificates.
+  cache_dir: ".cache/certs"
+
+# Authentication configuration
+auth:
+  # Provider: "basic" or "oauth2"
+  provider: "basic"
+
+  # Basic auth settings (used when provider is "basic")
+  basic:
+    users:
+      alice:
+        password: "changeme"
+        display_name: "Alice Smith"
+        email: "alice@example.com"
+      bob:
+        password: "changeme"
+        display_name: "Bob Jones"
+        email: "bob@example.com"
+
+  # OAuth2 / JWT settings (used when provider is "oauth2")
+  oauth2:
+    jwks_url: "https://login.example.com/.well-known/jwks.json"
+    issuer: "https://login.example.com/"
+    audience: "caldav-server"
+    user_id_claim: "sub"
