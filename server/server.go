@@ -10,8 +10,6 @@ import (
 )
 
 // New creates a CalDAV http.Handler with authentication and logging middleware.
-// Options are applied via functional option values. A default no-op logger is
-// used when none is provided.
 func New(opts ...Option) http.Handler {
 	cfg := &serverConfig{
 		logger: slog.New(slog.NewTextHandler(os.Stderr, nil)),
@@ -26,16 +24,17 @@ func New(opts ...Option) http.Handler {
 		Prefix:  cfg.prefix,
 	}
 
-	// Check if backend supports sync-collection.
-	var syncHandler http.Handler
-	if sb, ok := cfg.backend.(storage.SyncBackend); ok {
-		syncHandler = newSyncCollectionHandler(sb, caldavHandler, cfg.logger)
+	// If backend supports extended operations, wrap with our interceptor.
+	var h http.Handler
+	if eb, ok := cfg.backend.(storage.ExtendedBackend); ok {
+		h = newExtendedHandler(eb, caldavHandler, cfg.logger)
+	} else if sb, ok := cfg.backend.(storage.SyncBackend); ok {
+		h = newSyncCollectionHandler(sb, caldavHandler, cfg.logger)
 	} else {
-		syncHandler = caldavHandler
+		h = caldavHandler
 	}
 
 	// Wrap with middleware: auth first (innermost), then logging (outermost).
-	var h http.Handler = syncHandler
 	if cfg.auth != nil {
 		h = authMiddleware(cfg.auth, cfg.logger, h)
 	}

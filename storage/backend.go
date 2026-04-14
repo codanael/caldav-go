@@ -30,6 +30,13 @@ type SyncResponse struct {
 	Changes  []SyncChange
 }
 
+// CalendarUpdate holds optional fields to update on a calendar via PROPPATCH.
+type CalendarUpdate struct {
+	Name        *string
+	Description *string
+	Color       *string
+}
+
 // SyncBackend extends caldav.Backend with RFC 6578 sync-token support.
 type SyncBackend interface {
 	// GetSyncToken returns the current sync token for a calendar.
@@ -38,4 +45,15 @@ type SyncBackend interface {
 	// SyncCollection returns changes since the given sync token.
 	// If syncToken is empty, returns all current objects as "created".
 	SyncCollection(ctx context.Context, calendarPath string, syncToken string) (*SyncResponse, error)
+}
+
+// ExtendedBackend extends caldav.Backend with PROPPATCH and calendar deletion.
+type ExtendedBackend interface {
+	SyncBackend
+
+	// UpdateCalendar updates calendar properties via PROPPATCH.
+	UpdateCalendar(ctx context.Context, path string, update *CalendarUpdate) error
+
+	// DeleteCalendar deletes a calendar and all its objects.
+	DeleteCalendar(ctx context.Context, path string) error
 }

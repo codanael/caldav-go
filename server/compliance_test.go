@@ -790,3 +790,167 @@ func TestCompliance_SyncCollection_NoChanges(t *testing.T) {
 		t.Error("sync token should not change when nothing happened")
 	}
 }
+
+// TestCompliance_PROPPATCH_DisplayName tests updating calendar display name.
+func TestCompliance_PROPPATCH_DisplayName(t *testing.T) {
+	ts, client := setupCompliance(t)
+	ctx := context.Background()
+	calPath := "/testuser/calendars/pp1/"
+	createCalendar(t, ts.URL, calPath)
+
+	// PROPPATCH to change display name
+	proppatchBody := `<?xml version="1.0" encoding="UTF-8"?>
+<propertyupdate xmlns="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <set>
+    <prop>
+      <displayname>Renamed Calendar</displayname>
+    </prop>
+  </set>
+</propertyupdate>`
+
+	req, _ := http.NewRequest("PROPPATCH", ts.URL+calPath, strings.NewReader(proppatchBody))
+	req.SetBasicAuth("testuser", "testpass")
+	req.Header.Set("Content-Type", "application/xml")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("PROPPATCH: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusMultiStatus {
+		t.Fatalf("expected 207, got %d: %s", resp.StatusCode, body)
+	}
+
+	// Verify via FindCalendars
+	cals, err := client.FindCalendars(ctx, "/testuser/calendars/")
+	if err != nil {
+		t.Fatalf("FindCalendars: %v", err)
+	}
+	found := false
+	for _, c := range cals {
+		if c.Path == calPath && c.Name == "Renamed Calendar" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected calendar name 'Renamed Calendar', got calendars: %+v", cals)
+	}
+}
+
+// TestCompliance_PROPPATCH_Description tests updating calendar description.
+func TestCompliance_PROPPATCH_Description(t *testing.T) {
+	ts, _ := setupCompliance(t)
+	calPath := "/testuser/calendars/pp2/"
+	createCalendar(t, ts.URL, calPath)
+
+	proppatchBody := `<?xml version="1.0" encoding="UTF-8"?>
+<propertyupdate xmlns="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <set>
+    <prop>
+      <C:calendar-description>My important calendar</C:calendar-description>
+    </prop>
+  </set>
+</propertyupdate>`
+
+	req, _ := http.NewRequest("PROPPATCH", ts.URL+calPath, strings.NewReader(proppatchBody))
+	req.SetBasicAuth("testuser", "testpass")
+	req.Header.Set("Content-Type", "application/xml")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("PROPPATCH: %v", err)
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusMultiStatus {
+		t.Fatalf("expected 207, got %d", resp.StatusCode)
+	}
+}
+
+// TestCompliance_DeleteCalendar tests DELETE on a calendar collection.
+func TestCompliance_DeleteCalendar(t *testing.T) {
+	ts, client := setupCompliance(t)
+	ctx := context.Background()
+	calPath := "/testuser/calendars/to-delete/"
+	createCalendar(t, ts.URL, calPath)
+
+	// Add an event to the calendar
+	start := time.Date(2026, 11, 1, 10, 0, 0, 0, time.UTC)
+	end := time.Date(2026, 11, 1, 11, 0, 0, 0, time.UTC)
+	_, err := client.PutCalendarObject(ctx, calPath+"event-1.ics", makeTestEvent("ev1", "Doomed Event", start, end))
+	if err != nil {
+		t.Fatalf("put event: %v", err)
+	}
+
+	// DELETE the calendar collection
+	req, _ := http.NewRequest("DELETE", ts.URL+calPath, nil)
+	req.SetBasicAuth("testuser", "testpass")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("DELETE calendar: %v", err)
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d", resp.StatusCode)
+	}
+
+	// Verify calendar is gone
+	cals, err := client.FindCalendars(ctx, "/testuser/calendars/")
+	if err != nil {
+		t.Fatalf("FindCalendars: %v", err)
+	}
+	for _, c := range cals {
+		if c.Path == calPath {
+			t.Error("calendar should have been deleted")
+		}
+	}
+}
+
+// TestCompliance_PropFindSyncToken tests that PROPFIND on a calendar returns sync-token.
+func TestCompliance_PropFindSyncToken(t *testing.T) {
+	ts, client := setupCompliance(t)
+	ctx := context.Background()
+	calPath := "/testuser/calendars/synced/"
+	createCalendar(t, ts.URL, calPath)
+
+	// Add an event so sync-token advances
+	start := time.Date(2026, 12, 1, 10, 0, 0, 0, time.UTC)
+	end := time.Date(2026, 12, 1, 11, 0, 0, 0, time.UTC)
+	_, err := client.PutCalendarObject(ctx, calPath+"event-1.ics", makeTestEvent("ev1", "Event", start, end))
+	if err != nil {
+		t.Fatalf("put event: %v", err)
+	}
+
+	// PROPFIND with Depth: 0 asking for sync-token
+	propfindBody := `<?xml version="1.0" encoding="UTF-8"?>
+<propfind xmlns="DAV:">
+  <prop>
+    <displayname/>
+    <sync-token/>
+  </prop>
+</propfind>`
+
+	req, _ := http.NewRequest("PROPFIND", ts.URL+calPath, strings.NewReader(propfindBody))
+	req.SetBasicAuth("testuser", "testpass")
+	req.Header.Set("Content-Type", "application/xml")
+	req.Header.Set("Depth", "0")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("PROPFIND: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusMultiStatus {
+		t.Fatalf("expected 207, got %d: %s", resp.StatusCode, body)
+	}
+
+	bodyStr := string(body)
+	if !strings.Contains(bodyStr, "sync-token") {
+		t.Errorf("expected sync-token in PROPFIND response, got:\n%s", bodyStr)
+	}
+	if !strings.Contains(bodyStr, "sync-token-") {
+		t.Errorf("expected sync-token value in PROPFIND response, got:\n%s", bodyStr)
+	}
+}

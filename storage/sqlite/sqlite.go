@@ -155,6 +155,75 @@ func (b *Backend) GetCalendar(ctx context.Context, path string) (*caldav.Calenda
 	return &cal, nil
 }
 
+// UpdateCalendar updates calendar properties.
+func (b *Backend) UpdateCalendar(ctx context.Context, path string, update *storage.CalendarUpdate) error {
+	userID := storage.UserFromContext(ctx)
+	if userID == "" {
+		return httpError(http.StatusUnauthorized, "caldav: no user in context")
+	}
+
+	// Build dynamic UPDATE query.
+	sets := []string{}
+	args := []any{}
+	if update.Name != nil {
+		sets = append(sets, "name = ?")
+		args = append(args, *update.Name)
+	}
+	if update.Description != nil {
+		sets = append(sets, "description = ?")
+		args = append(args, *update.Description)
+	}
+	if update.Color != nil {
+		sets = append(sets, "color = ?")
+		args = append(args, *update.Color)
+	}
+	if len(sets) == 0 {
+		return nil
+	}
+
+	sets = append(sets, "updated_at = ?")
+	args = append(args, time.Now().UTC())
+	args = append(args, path, userID)
+
+	query := "UPDATE calendars SET " + strings.Join(sets, ", ") + " WHERE path = ? AND user_id = ?"
+	result, err := b.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("sqlite: update calendar: %w", err)
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("sqlite: rows affected: %w", err)
+	}
+	if n == 0 {
+		return httpError(http.StatusNotFound, "caldav: calendar not found")
+	}
+	return nil
+}
+
+// DeleteCalendar deletes a calendar and all its objects.
+func (b *Backend) DeleteCalendar(ctx context.Context, path string) error {
+	userID := storage.UserFromContext(ctx)
+	if userID == "" {
+		return httpError(http.StatusUnauthorized, "caldav: no user in context")
+	}
+
+	result, err := b.db.ExecContext(ctx,
+		`DELETE FROM calendars WHERE path = ? AND user_id = ?`,
+		path, userID,
+	)
+	if err != nil {
+		return fmt.Errorf("sqlite: delete calendar: %w", err)
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("sqlite: rows affected: %w", err)
+	}
+	if n == 0 {
+		return httpError(http.StatusNotFound, "caldav: calendar not found")
+	}
+	return nil
+}
+
 // getCalendarByPath returns the calendar ID and user_id for a given path.
 func (b *Backend) getCalendarByPath(ctx context.Context, calendarPath string) (int64, string, error) {
 	var id int64
