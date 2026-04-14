@@ -7,7 +7,12 @@ listen_addr: ":8080"
 # Base URL path prefix. Set to "/caldav" if reverse-proxying under a subpath.
 base_path: "/"
 
-# Path to the SQLite database file.
+# Storage driver: "sqlite" or "postgres"
+db_driver: "sqlite"
+
+# Database path (SQLite) or connection string (PostgreSQL).
+# SQLite:    "./caldav.db"
+# Postgres:  "postgres://user:pass@localhost:5432/caldav?sslmode=disable"
 db_path: "./caldav.db"
 
 # Logging level: debug, info, warn, error
