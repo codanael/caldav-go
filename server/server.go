@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 
+	"github.com/codanael/caldav-go/storage"
 	"github.com/emersion/go-webdav/caldav"
 )
 
@@ -20,13 +21,21 @@ func New(opts ...Option) http.Handler {
 	}
 
 	// Build the core CalDAV handler from go-webdav.
-	handler := &caldav.Handler{
+	caldavHandler := &caldav.Handler{
 		Backend: cfg.backend,
 		Prefix:  cfg.prefix,
 	}
 
+	// Check if backend supports sync-collection.
+	var syncHandler http.Handler
+	if sb, ok := cfg.backend.(storage.SyncBackend); ok {
+		syncHandler = newSyncCollectionHandler(sb, caldavHandler, cfg.logger)
+	} else {
+		syncHandler = caldavHandler
+	}
+
 	// Wrap with middleware: auth first (innermost), then logging (outermost).
-	var h http.Handler = handler
+	var h http.Handler = syncHandler
 	if cfg.auth != nil {
 		h = authMiddleware(cfg.auth, cfg.logger, h)
 	}

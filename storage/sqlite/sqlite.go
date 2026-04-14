@@ -283,19 +283,54 @@ func (b *Backend) PutCalendarObject(ctx context.Context, path string, calendar *
 
 	size := int64(len(icalData))
 
+	// Use a transaction to atomically update the object, bump sync token, and record change.
+	tx, err := b.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	changeType := "created"
 	if existingFound {
-		_, err = b.db.ExecContext(ctx,
+		changeType = "modified"
+		_, err = tx.ExecContext(ctx,
 			`UPDATE calendar_objects SET uid=?, etag=?, ical_data=?, comp_type=?, start_time=?, end_time=?, size=?, updated_at=? WHERE id=?`,
 			uid, etag, icalData, compType, startTime, endTime, size, now, existingID,
 		)
 	} else {
-		_, err = b.db.ExecContext(ctx,
+		_, err = tx.ExecContext(ctx,
 			`INSERT INTO calendar_objects (calendar_id, path, uid, etag, ical_data, comp_type, start_time, end_time, size, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			calID, path, uid, etag, icalData, compType, startTime, endTime, size, now, now,
 		)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: put calendar object: %w", err)
+	}
+
+	// Bump sync token and record change.
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE calendars SET sync_token = sync_token + 1, updated_at = ? WHERE id = ?`,
+		now, calID,
+	); err != nil {
+		return nil, fmt.Errorf("sqlite: bump sync token: %w", err)
+	}
+
+	var newToken int64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT sync_token FROM calendars WHERE id = ?`, calID,
+	).Scan(&newToken); err != nil {
+		return nil, fmt.Errorf("sqlite: get new sync token: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO sync_changes (calendar_id, object_path, change_type, sync_token) VALUES (?, ?, ?, ?)`,
+		calID, path, changeType, newToken,
+	); err != nil {
+		return nil, fmt.Errorf("sqlite: record sync change: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("sqlite: commit: %w", err)
 	}
 
 	return &caldav.CalendarObject{
@@ -461,11 +496,25 @@ func (b *Backend) DeleteCalendarObject(ctx context.Context, path string) error {
 		return httpError(http.StatusUnauthorized, "caldav: no user in context")
 	}
 
-	result, err := b.db.ExecContext(ctx,
-		`DELETE FROM calendar_objects WHERE path = ? AND calendar_id IN (
-			SELECT id FROM calendars WHERE user_id = ?
-		)`,
-		path, userID,
+	// Find the calendar that owns this object.
+	calendarPath := calendarPathFromObjectPath(path)
+	calID, ownerID, err := b.getCalendarByPath(ctx, calendarPath)
+	if err != nil {
+		return err
+	}
+	if ownerID != userID {
+		return httpError(http.StatusForbidden, "caldav: calendar does not belong to user")
+	}
+
+	tx, err := b.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("sqlite: begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	result, err := tx.ExecContext(ctx,
+		`DELETE FROM calendar_objects WHERE path = ? AND calendar_id = ?`,
+		path, calID,
 	)
 	if err != nil {
 		return fmt.Errorf("sqlite: delete calendar object: %w", err)
@@ -478,5 +527,159 @@ func (b *Backend) DeleteCalendarObject(ctx context.Context, path string) error {
 	if n == 0 {
 		return httpError(http.StatusNotFound, "caldav: calendar object not found")
 	}
-	return nil
+
+	now := time.Now().UTC()
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE calendars SET sync_token = sync_token + 1, updated_at = ? WHERE id = ?`,
+		now, calID,
+	); err != nil {
+		return fmt.Errorf("sqlite: bump sync token: %w", err)
+	}
+
+	var newToken int64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT sync_token FROM calendars WHERE id = ?`, calID,
+	).Scan(&newToken); err != nil {
+		return fmt.Errorf("sqlite: get new sync token: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO sync_changes (calendar_id, object_path, change_type, sync_token) VALUES (?, ?, ?, ?)`,
+		calID, path, "deleted", newToken,
+	); err != nil {
+		return fmt.Errorf("sqlite: record sync change: %w", err)
+	}
+
+	return tx.Commit()
+}
+
+// GetSyncToken returns the current sync token for a calendar.
+func (b *Backend) GetSyncToken(ctx context.Context, calendarPath string) (string, error) {
+	userID := storage.UserFromContext(ctx)
+	if userID == "" {
+		return "", httpError(http.StatusUnauthorized, "caldav: no user in context")
+	}
+
+	var token int64
+	err := b.db.QueryRowContext(ctx,
+		`SELECT sync_token FROM calendars WHERE path = ? AND user_id = ?`,
+		calendarPath, userID,
+	).Scan(&token)
+	if err == sql.ErrNoRows {
+		return "", httpError(http.StatusNotFound, "caldav: calendar not found")
+	}
+	if err != nil {
+		return "", fmt.Errorf("sqlite: get sync token: %w", err)
+	}
+	return fmt.Sprintf("sync-token-%d", token), nil
+}
+
+// SyncCollection returns changes since the given sync token.
+// If syncToken is empty, returns all current objects.
+func (b *Backend) SyncCollection(ctx context.Context, calendarPath string, syncToken string) (*storage.SyncResponse, error) {
+	userID := storage.UserFromContext(ctx)
+	if userID == "" {
+		return nil, httpError(http.StatusUnauthorized, "caldav: no user in context")
+	}
+
+	var calID int64
+	var currentToken int64
+	err := b.db.QueryRowContext(ctx,
+		`SELECT id, sync_token FROM calendars WHERE path = ? AND user_id = ?`,
+		calendarPath, userID,
+	).Scan(&calID, &currentToken)
+	if err == sql.ErrNoRows {
+		return nil, httpError(http.StatusNotFound, "caldav: calendar not found")
+	}
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: get calendar: %w", err)
+	}
+
+	newToken := fmt.Sprintf("sync-token-%d", currentToken)
+
+	// If no sync token provided, return all current objects as "created".
+	if syncToken == "" {
+		rows, err := b.db.QueryContext(ctx,
+			`SELECT path, etag FROM calendar_objects WHERE calendar_id = ?`, calID,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("sqlite: list objects for sync: %w", err)
+		}
+		defer rows.Close()
+
+		resp := &storage.SyncResponse{NewToken: newToken}
+		for rows.Next() {
+			var ch storage.SyncChange
+			if err := rows.Scan(&ch.Path, &ch.ETag); err != nil {
+				return nil, fmt.Errorf("sqlite: scan object: %w", err)
+			}
+			ch.ChangeType = "created"
+			resp.Changes = append(resp.Changes, ch)
+		}
+		return resp, rows.Err()
+	}
+
+	// Parse the token number.
+	var requestedToken int64
+	if _, err := fmt.Sscanf(syncToken, "sync-token-%d", &requestedToken); err != nil {
+		return nil, httpError(http.StatusPreconditionFailed, "caldav: invalid sync token")
+	}
+
+	if requestedToken > currentToken {
+		return nil, httpError(http.StatusPreconditionFailed, "caldav: sync token is in the future")
+	}
+
+	// Get changes since the requested token.
+	// We need the latest change per path (in case an object was created then modified).
+	rows, err := b.db.QueryContext(ctx,
+		`SELECT sc.object_path, sc.change_type, co.etag
+		 FROM sync_changes sc
+		 LEFT JOIN calendar_objects co ON co.path = sc.object_path AND co.calendar_id = sc.calendar_id
+		 WHERE sc.calendar_id = ? AND sc.sync_token > ?
+		 ORDER BY sc.sync_token ASC`,
+		calID, requestedToken,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: query sync changes: %w", err)
+	}
+	defer rows.Close()
+
+	// Deduplicate: keep the latest state per path.
+	seen := make(map[string]*storage.SyncChange)
+	var order []string
+	for rows.Next() {
+		var objPath, changeType string
+		var etag sql.NullString
+		if err := rows.Scan(&objPath, &changeType, &etag); err != nil {
+			return nil, fmt.Errorf("sqlite: scan sync change: %w", err)
+		}
+
+		ch := &storage.SyncChange{
+			Path:       objPath,
+			ChangeType: changeType,
+			ETag:       etag.String,
+		}
+
+		// If the object was deleted after being created/modified, mark as deleted.
+		// If created then modified, just show the final etag as modified.
+		if _, exists := seen[objPath]; !exists {
+			order = append(order, objPath)
+		}
+		seen[objPath] = ch
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	resp := &storage.SyncResponse{NewToken: newToken}
+	for _, p := range order {
+		ch := seen[p]
+		// If the object no longer exists (LEFT JOIN etag is NULL) but change says
+		// created/modified, it was created then deleted — report as deleted.
+		if ch.ChangeType != "deleted" && ch.ETag == "" {
+			ch.ChangeType = "deleted"
+		}
+		resp.Changes = append(resp.Changes, *ch)
+	}
+	return resp, nil
 }

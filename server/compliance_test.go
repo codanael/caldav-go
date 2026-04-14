@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"encoding/xml"
+
 	"github.com/codanael/caldav-go/auth"
 	"github.com/codanael/caldav-go/storage/sqlite"
 	"github.com/emersion/go-ical"
@@ -571,5 +573,220 @@ func TestCompliance_UpdateEvent(t *testing.T) {
 				t.Errorf("expected 'Updated Title', got %q", summary)
 			}
 		}
+	}
+}
+
+// syncMultistatusResp is used to parse sync-collection REPORT responses.
+type syncMultistatusResp struct {
+	XMLName   xml.Name           `xml:"multistatus"`
+	Responses []syncRespEntry    `xml:"response"`
+	SyncToken string             `xml:"sync-token"`
+}
+
+type syncRespEntry struct {
+	Href     string          `xml:"href"`
+	Status   string          `xml:"status"`
+	PropStat *syncPropStatResp `xml:"propstat"`
+}
+
+type syncPropStatResp struct {
+	Prop   syncPropResp `xml:"prop"`
+	Status string       `xml:"status"`
+}
+
+type syncPropResp struct {
+	GetETag string `xml:"getetag"`
+}
+
+func createCalendar(t *testing.T, tsURL, path string) {
+	t.Helper()
+	mkcolBody := `<?xml version="1.0" encoding="UTF-8"?>
+<mkcol xmlns="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <set><prop>
+    <resourcetype><collection/><C:calendar/></resourcetype>
+    <displayname>Sync Test</displayname>
+  </prop></set>
+</mkcol>`
+	req, _ := http.NewRequest("MKCOL", tsURL+path, strings.NewReader(mkcolBody))
+	req.SetBasicAuth("testuser", "testpass")
+	req.Header.Set("Content-Type", "application/xml")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("MKCOL: %v", err)
+	}
+	resp.Body.Close()
+}
+
+func syncCollection(t *testing.T, tsURL, calPath, syncToken string) *syncMultistatusResp {
+	t.Helper()
+	syncBody := `<?xml version="1.0" encoding="UTF-8"?>
+<sync-collection xmlns="DAV:">
+  <sync-token>` + syncToken + `</sync-token>
+  <sync-level>1</sync-level>
+  <prop>
+    <getetag/>
+  </prop>
+</sync-collection>`
+
+	req, _ := http.NewRequest("REPORT", tsURL+calPath, strings.NewReader(syncBody))
+	req.SetBasicAuth("testuser", "testpass")
+	req.Header.Set("Content-Type", "application/xml")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("REPORT sync-collection: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusMultiStatus {
+		t.Fatalf("expected 207, got %d: %s", resp.StatusCode, body)
+	}
+
+	var ms syncMultistatusResp
+	if err := xml.Unmarshal(body, &ms); err != nil {
+		t.Fatalf("unmarshal sync response: %v\n%s", err, body)
+	}
+	return &ms
+}
+
+// TestCompliance_SyncCollection_InitialSync tests initial sync with empty token.
+func TestCompliance_SyncCollection_InitialSync(t *testing.T) {
+	ts, client := setupCompliance(t)
+	ctx := context.Background()
+	calPath := "/testuser/calendars/sync1/"
+	createCalendar(t, ts.URL, calPath)
+
+	// Add two events
+	start := time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC)
+	end := time.Date(2026, 10, 1, 11, 0, 0, 0, time.UTC)
+	_, err := client.PutCalendarObject(ctx, calPath+"event-1.ics", makeTestEvent("ev1", "Event 1", start, end))
+	if err != nil {
+		t.Fatalf("put event-1: %v", err)
+	}
+	_, err = client.PutCalendarObject(ctx, calPath+"event-2.ics", makeTestEvent("ev2", "Event 2", start.Add(time.Hour), end.Add(time.Hour)))
+	if err != nil {
+		t.Fatalf("put event-2: %v", err)
+	}
+
+	// Initial sync (empty token) should return all objects
+	ms := syncCollection(t, ts.URL, calPath, "")
+	if len(ms.Responses) != 2 {
+		t.Fatalf("expected 2 responses on initial sync, got %d", len(ms.Responses))
+	}
+	if ms.SyncToken == "" {
+		t.Fatal("expected non-empty sync token")
+	}
+
+	// All responses should have ETags (not deleted)
+	for _, r := range ms.Responses {
+		if r.PropStat == nil {
+			t.Errorf("expected propstat for %s", r.Href)
+		}
+	}
+}
+
+// TestCompliance_SyncCollection_IncrementalSync tests sync after changes.
+func TestCompliance_SyncCollection_IncrementalSync(t *testing.T) {
+	ts, client := setupCompliance(t)
+	ctx := context.Background()
+	calPath := "/testuser/calendars/sync2/"
+	createCalendar(t, ts.URL, calPath)
+
+	// Add an event
+	start := time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC)
+	end := time.Date(2026, 10, 1, 11, 0, 0, 0, time.UTC)
+	_, err := client.PutCalendarObject(ctx, calPath+"event-1.ics", makeTestEvent("ev1", "Event 1", start, end))
+	if err != nil {
+		t.Fatalf("put event-1: %v", err)
+	}
+
+	// Get initial sync token
+	ms1 := syncCollection(t, ts.URL, calPath, "")
+	token := ms1.SyncToken
+
+	// Add another event
+	_, err = client.PutCalendarObject(ctx, calPath+"event-2.ics", makeTestEvent("ev2", "Event 2", start.Add(time.Hour), end.Add(time.Hour)))
+	if err != nil {
+		t.Fatalf("put event-2: %v", err)
+	}
+
+	// Incremental sync should only return the new event
+	ms2 := syncCollection(t, ts.URL, calPath, token)
+	if len(ms2.Responses) != 1 {
+		t.Fatalf("expected 1 change, got %d", len(ms2.Responses))
+	}
+	if !strings.Contains(ms2.Responses[0].Href, "event-2") {
+		t.Errorf("expected event-2 in response, got %s", ms2.Responses[0].Href)
+	}
+	if ms2.SyncToken == token {
+		t.Error("sync token should have advanced")
+	}
+}
+
+// TestCompliance_SyncCollection_DeletedObjects tests that deleted objects show as 404.
+func TestCompliance_SyncCollection_DeletedObjects(t *testing.T) {
+	ts, client := setupCompliance(t)
+	ctx := context.Background()
+	calPath := "/testuser/calendars/sync3/"
+	createCalendar(t, ts.URL, calPath)
+
+	// Add and sync
+	start := time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC)
+	end := time.Date(2026, 10, 1, 11, 0, 0, 0, time.UTC)
+	_, err := client.PutCalendarObject(ctx, calPath+"event-1.ics", makeTestEvent("ev1", "Event 1", start, end))
+	if err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	ms1 := syncCollection(t, ts.URL, calPath, "")
+	token := ms1.SyncToken
+
+	// Delete the event
+	delReq, _ := http.NewRequest("DELETE", ts.URL+calPath+"event-1.ics", nil)
+	delReq.SetBasicAuth("testuser", "testpass")
+	delResp, err := http.DefaultClient.Do(delReq)
+	if err != nil {
+		t.Fatalf("DELETE: %v", err)
+	}
+	delResp.Body.Close()
+
+	// Sync should show the deleted object with 404 status
+	ms2 := syncCollection(t, ts.URL, calPath, token)
+	if len(ms2.Responses) != 1 {
+		t.Fatalf("expected 1 change (delete), got %d", len(ms2.Responses))
+	}
+	r := ms2.Responses[0]
+	if !strings.Contains(r.Href, "event-1") {
+		t.Errorf("expected event-1, got %s", r.Href)
+	}
+	if !strings.Contains(r.Status, "404") {
+		t.Errorf("expected 404 status for deleted object, got %q", r.Status)
+	}
+}
+
+// TestCompliance_SyncCollection_NoChanges tests sync when nothing changed.
+func TestCompliance_SyncCollection_NoChanges(t *testing.T) {
+	ts, client := setupCompliance(t)
+	ctx := context.Background()
+	calPath := "/testuser/calendars/sync4/"
+	createCalendar(t, ts.URL, calPath)
+
+	start := time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC)
+	end := time.Date(2026, 10, 1, 11, 0, 0, 0, time.UTC)
+	_, err := client.PutCalendarObject(ctx, calPath+"event-1.ics", makeTestEvent("ev1", "Event 1", start, end))
+	if err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	ms1 := syncCollection(t, ts.URL, calPath, "")
+	token := ms1.SyncToken
+
+	// Sync again with same token — no changes expected
+	ms2 := syncCollection(t, ts.URL, calPath, token)
+	if len(ms2.Responses) != 0 {
+		t.Fatalf("expected 0 changes, got %d", len(ms2.Responses))
+	}
+	if ms2.SyncToken != token {
+		t.Error("sync token should not change when nothing happened")
 	}
 }
