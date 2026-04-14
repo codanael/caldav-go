@@ -46,7 +46,7 @@ func newExtendedHandler(eb storage.ExtendedBackend, inner http.Handler, logger *
 				return
 			}
 		case "PROPFIND":
-			if isCalendarPath(r.URL.Path) {
+			if isCalendarPath(r.URL.Path) || isCalendarHomeSetPath(r.URL.Path) {
 				handlePropFindCalendar(w, r, eb, inner, logger)
 				return
 			}
@@ -73,6 +73,11 @@ func newExtendedHandler(eb storage.ExtendedBackend, inner http.Handler, logger *
 
 		inner.ServeHTTP(w, r)
 	})
+}
+
+// isCalendarHomeSetPath returns true if the path is a calendar home set (2 segments: /{user}/calendars/).
+func isCalendarHomeSetPath(path string) bool {
+	return resourceLevel(path) == 2
 }
 
 // isPrincipalPath returns true if the path looks like a user principal (1 segment: /{user}/).
@@ -271,7 +276,6 @@ func (w *propfindResponseWriter) Write(b []byte) (int, error) {
 }
 
 func handlePropFindCalendar(w http.ResponseWriter, r *http.Request, eb storage.ExtendedBackend, inner http.Handler, logger *slog.Logger) {
-	// Capture the inner handler's response.
 	rec := &propfindResponseWriter{ResponseWriter: w}
 	inner.ServeHTTP(rec, r)
 
@@ -281,40 +285,85 @@ func handlePropFindCalendar(w http.ResponseWriter, r *http.Request, eb storage.E
 
 	body := rec.buf.String()
 
-	// Gather extended properties to inject.
-	token, tokenErr := eb.GetSyncToken(r.Context(), r.URL.Path)
-	extra, extraErr := eb.GetCalendarExtra(r.Context(), r.URL.Path)
-
 	// Remove 404 propstat blocks for properties we'll provide.
 	body = remove404PropstatBlock(body, "sync-token")
 	body = remove404PropstatBlock(body, "getctag")
 	body = remove404PropstatBlock(body, "calendar-color")
 	body = remove404PropstatBlock(body, "supported-report-set")
 
-	// Inject properties into the 200 propstat.
-	var propsToInject []string
+	// Find all calendar paths in the response (handles both single calendar
+	// and home set Depth:1 listing).
+	calPaths := extractCalendarPaths(body)
 
-	if tokenErr == nil && token != "" {
-		propsToInject = append(propsToInject,
-			fmt.Sprintf(`<sync-token xmlns="DAV:">%s</sync-token>`, token),
-			fmt.Sprintf(`<getctag xmlns="http://calendarserver.org/ns/">%s</getctag>`, token),
-		)
+	for _, calPath := range calPaths {
+		var propsToInject []string
+
+		token, tokenErr := eb.GetSyncToken(r.Context(), calPath)
+		if tokenErr == nil && token != "" {
+			propsToInject = append(propsToInject,
+				fmt.Sprintf(`<sync-token xmlns="DAV:">%s</sync-token>`, token),
+				fmt.Sprintf(`<getctag xmlns="http://calendarserver.org/ns/">%s</getctag>`, token),
+			)
+		}
+
+		extra, extraErr := eb.GetCalendarExtra(r.Context(), calPath)
+		if extraErr == nil && extra != nil && extra.Color != "" {
+			propsToInject = append(propsToInject,
+				fmt.Sprintf(`<calendar-color xmlns="http://apple.com/ns/ical/">%s</calendar-color>`, extra.Color),
+			)
+		}
+
+		propsToInject = append(propsToInject, supportedReportSetXML)
+		body = injectIntoProps(body, calPath, propsToInject)
 	}
-
-	if extraErr == nil && extra != nil && extra.Color != "" {
-		propsToInject = append(propsToInject,
-			fmt.Sprintf(`<calendar-color xmlns="http://apple.com/ns/ical/">%s</calendar-color>`, extra.Color),
-		)
-	}
-
-	// Always advertise supported reports.
-	propsToInject = append(propsToInject, supportedReportSetXML)
-
-	body = injectIntoProps(body, r.URL.Path, propsToInject)
 
 	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
 	w.WriteHeader(http.StatusMultiStatus)
 	fmt.Fprint(w, body)
+}
+
+// extractCalendarPaths finds all calendar collection paths in a multistatus response.
+// A calendar response contains both <collection/> and <calendar/> in its resourcetype.
+func extractCalendarPaths(xmlBody string) []string {
+	var paths []string
+	// Find all <href>...</href> entries and check if their response contains "calendar"
+	// in the resourcetype.
+	remaining := xmlBody
+	for {
+		respIdx := strings.Index(remaining, "<response")
+		if respIdx < 0 {
+			break
+		}
+		respEnd := strings.Index(remaining[respIdx:], "</response>")
+		if respEnd < 0 {
+			break
+		}
+		respEnd = respIdx + respEnd + len("</response>")
+		respBlock := remaining[respIdx:respEnd]
+
+		// Check if this response is a calendar collection.
+		if strings.Contains(respBlock, "calendar") {
+			// Extract href.
+			hrefStart := strings.Index(respBlock, "<href")
+			if hrefStart >= 0 {
+				hrefEnd := strings.Index(respBlock[hrefStart:], "</href>")
+				if hrefEnd >= 0 {
+					hrefContent := respBlock[hrefStart : hrefStart+hrefEnd+len("</href>")]
+					// Extract path from <href ...>path</href>
+					gtIdx := strings.Index(hrefContent, ">")
+					if gtIdx >= 0 {
+						path := hrefContent[gtIdx+1 : strings.Index(hrefContent, "</href>")]
+						if isCalendarPath(path) {
+							paths = append(paths, path)
+						}
+					}
+				}
+			}
+		}
+
+		remaining = remaining[respEnd:]
+	}
+	return paths
 }
 
 const supportedReportSetXML = `<supported-report-set xmlns="DAV:">` +
