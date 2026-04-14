@@ -224,6 +224,27 @@ func (b *Backend) DeleteCalendar(ctx context.Context, path string) error {
 	return nil
 }
 
+// GetCalendarExtra returns extended properties (color) for a calendar.
+func (b *Backend) GetCalendarExtra(ctx context.Context, path string) (*storage.CalendarExtra, error) {
+	userID := storage.UserFromContext(ctx)
+	if userID == "" {
+		return nil, httpError(http.StatusUnauthorized, "caldav: no user in context")
+	}
+
+	var color string
+	err := b.db.QueryRowContext(ctx,
+		`SELECT color FROM calendars WHERE path = ? AND user_id = ?`,
+		path, userID,
+	).Scan(&color)
+	if err == sql.ErrNoRows {
+		return nil, httpError(http.StatusNotFound, "caldav: calendar not found")
+	}
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: get calendar extra: %w", err)
+	}
+	return &storage.CalendarExtra{Color: color}, nil
+}
+
 // getCalendarByPath returns the calendar ID and user_id for a given path.
 func (b *Backend) getCalendarByPath(ctx context.Context, calendarPath string) (int64, string, error) {
 	var id int64

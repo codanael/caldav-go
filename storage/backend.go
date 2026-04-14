@@ -47,6 +47,11 @@ type SyncBackend interface {
 	SyncCollection(ctx context.Context, calendarPath string, syncToken string) (*SyncResponse, error)
 }
 
+// CalendarExtra holds extended calendar properties not in caldav.Calendar.
+type CalendarExtra struct {
+	Color string
+}
+
 // ExtendedBackend extends caldav.Backend with PROPPATCH and calendar deletion.
 type ExtendedBackend interface {
 	SyncBackend
@@ -56,4 +61,7 @@ type ExtendedBackend interface {
 
 	// DeleteCalendar deletes a calendar and all its objects.
 	DeleteCalendar(ctx context.Context, path string) error
+
+	// GetCalendarExtra returns extended properties for a calendar.
+	GetCalendarExtra(ctx context.Context, path string) (*CalendarExtra, error)
 }

@@ -47,7 +47,7 @@ func newExtendedHandler(eb storage.ExtendedBackend, inner http.Handler, logger *
 			}
 		case "PROPFIND":
 			if isCalendarPath(r.URL.Path) {
-				handlePropFindWithSync(w, r, eb, inner, logger)
+				handlePropFindCalendar(w, r, eb, inner, logger)
 				return
 			}
 		case "REPORT":
@@ -175,10 +175,10 @@ func handleDeleteCalendar(w http.ResponseWriter, r *http.Request, eb storage.Ext
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// --- PROPFIND with sync-token injection ---
+// --- PROPFIND with extended property injection ---
 
 // propfindResponseWriter captures the inner handler's PROPFIND response
-// so we can inject the sync-token property.
+// so we can inject additional properties.
 type propfindResponseWriter struct {
 	http.ResponseWriter
 	buf        bytes.Buffer
@@ -190,7 +190,6 @@ func (w *propfindResponseWriter) WriteHeader(code int) {
 	w.statusCode = code
 	if code == http.StatusMultiStatus {
 		w.hijacked = true
-		// Don't write to the real response yet — we'll modify it first.
 		return
 	}
 	w.ResponseWriter.WriteHeader(code)
@@ -203,93 +202,120 @@ func (w *propfindResponseWriter) Write(b []byte) (int, error) {
 	return w.ResponseWriter.Write(b)
 }
 
-func handlePropFindWithSync(w http.ResponseWriter, r *http.Request, eb storage.ExtendedBackend, inner http.Handler, logger *slog.Logger) {
+func handlePropFindCalendar(w http.ResponseWriter, r *http.Request, eb storage.ExtendedBackend, inner http.Handler, logger *slog.Logger) {
 	// Capture the inner handler's response.
 	rec := &propfindResponseWriter{ResponseWriter: w}
 	inner.ServeHTTP(rec, r)
 
 	if !rec.hijacked {
-		return // Non-207 response, already written directly.
-	}
-
-	// Get the sync token for this calendar.
-	token, err := eb.GetSyncToken(r.Context(), r.URL.Path)
-	if err != nil {
-		logger.Debug("could not get sync token for PROPFIND", "path", r.URL.Path, "error", err)
-		// Fall through without injection.
-		w.WriteHeader(http.StatusMultiStatus)
-		w.Write(rec.buf.Bytes())
 		return
 	}
 
-	// Inject sync-token into the XML response.
-	// We look for the calendar's <response> and add <sync-token> as a prop.
 	body := rec.buf.String()
-	body = injectSyncToken(body, r.URL.Path, token)
+
+	// Gather extended properties to inject.
+	token, tokenErr := eb.GetSyncToken(r.Context(), r.URL.Path)
+	extra, extraErr := eb.GetCalendarExtra(r.Context(), r.URL.Path)
+
+	// Remove 404 propstat blocks for properties we'll provide.
+	body = remove404PropstatBlock(body, "sync-token")
+	body = remove404PropstatBlock(body, "getctag")
+	body = remove404PropstatBlock(body, "calendar-color")
+	body = remove404PropstatBlock(body, "supported-report-set")
+
+	// Inject properties into the 200 propstat.
+	var propsToInject []string
+
+	if tokenErr == nil && token != "" {
+		propsToInject = append(propsToInject,
+			fmt.Sprintf(`<sync-token xmlns="DAV:">%s</sync-token>`, token),
+			fmt.Sprintf(`<getctag xmlns="http://calendarserver.org/ns/">%s</getctag>`, token),
+		)
+	}
+
+	if extraErr == nil && extra != nil && extra.Color != "" {
+		propsToInject = append(propsToInject,
+			fmt.Sprintf(`<calendar-color xmlns="http://apple.com/ns/ical/">%s</calendar-color>`, extra.Color),
+		)
+	}
+
+	// Always advertise supported reports.
+	propsToInject = append(propsToInject, supportedReportSetXML)
+
+	body = injectIntoProps(body, r.URL.Path, propsToInject)
 
 	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
 	w.WriteHeader(http.StatusMultiStatus)
 	fmt.Fprint(w, body)
 }
 
-// injectSyncToken replaces the empty/404 sync-token property with the actual
-// value in a PROPFIND multistatus response.
-func injectSyncToken(xmlBody string, calPath string, token string) string {
-	syncTokenWithValue := fmt.Sprintf(`<sync-token xmlns="DAV:">%s</sync-token>`, token)
+const supportedReportSetXML = `<supported-report-set xmlns="DAV:">` +
+	`<supported-report><report><calendar-query xmlns="urn:ietf:params:xml:ns:caldav"/></report></supported-report>` +
+	`<supported-report><report><calendar-multiget xmlns="urn:ietf:params:xml:ns:caldav"/></report></supported-report>` +
+	`<supported-report><report><sync-collection xmlns="DAV:"/></report></supported-report>` +
+	`</supported-report-set>`
 
-	// Strategy 1: Replace the 404 propstat block that contains sync-token.
-	// go-webdav returns unknown properties as 404:
-	//   <propstat><prop><sync-token></sync-token></prop><status>HTTP/1.1 404 Not Found</status></propstat>
-	// We want to move sync-token into the 200 propstat with the actual value.
-
-	// Find and remove the 404 propstat containing sync-token.
-	// Look for the pattern: <propstat...><prop...><sync-token...></sync-token></prop><status>HTTP/1.1 404 Not Found</status></propstat>
-	for _, nsPrefix := range []string{`xmlns="DAV:"`, ""} {
-		var emptyToken string
-		if nsPrefix != "" {
-			emptyToken = fmt.Sprintf(`<sync-token %s></sync-token>`, nsPrefix)
-		} else {
-			emptyToken = `<sync-token></sync-token>`
-		}
-
-		idx := strings.Index(xmlBody, emptyToken)
+// remove404PropstatBlock removes a 404 propstat that contains the given property name.
+func remove404PropstatBlock(xmlBody string, propLocalName string) string {
+	// Look for the property in a 404 propstat block and remove the entire block.
+	for _, pattern := range []string{
+		fmt.Sprintf(`<%s `, propLocalName),
+		fmt.Sprintf(`<%s>`, propLocalName),
+		fmt.Sprintf(`<%s/>`, propLocalName),
+	} {
+		idx := strings.Index(xmlBody, pattern)
 		if idx < 0 {
 			continue
 		}
 
-		// Find the enclosing <propstat> ... </propstat> for this 404 block.
-		// Search backwards for <propstat
 		propstatStart := strings.LastIndex(xmlBody[:idx], "<propstat")
 		if propstatStart < 0 {
 			continue
 		}
-		// Search forward for </propstat>
 		propstatEnd := strings.Index(xmlBody[propstatStart:], "</propstat>")
 		if propstatEnd < 0 {
 			continue
 		}
 		propstatEnd = propstatStart + propstatEnd + len("</propstat>")
 
-		propstatBlock := xmlBody[propstatStart:propstatEnd]
-		if strings.Contains(propstatBlock, "404") {
-			// Remove this 404 propstat block entirely.
+		block := xmlBody[propstatStart:propstatEnd]
+		if strings.Contains(block, "404") {
 			xmlBody = xmlBody[:propstatStart] + xmlBody[propstatEnd:]
+			// Recurse in case there are multiple 404 blocks with this property.
+			return remove404PropstatBlock(xmlBody, propLocalName)
 		}
 	}
+	return xmlBody
+}
 
-	// Now inject the sync-token with value into the 200 propstat's <prop>.
-	// Find the first </prop> inside a 200 propstat for our calendar.
+// injectIntoProps injects XML property strings into the 200 propstat's <prop>
+// for the response matching calPath.
+func injectIntoProps(xmlBody string, calPath string, props []string) string {
+	if len(props) == 0 {
+		return xmlBody
+	}
+
 	hrefTag := calPath + "</href>"
 	hrefIdx := strings.Index(xmlBody, hrefTag)
 	if hrefIdx < 0 {
 		return xmlBody
 	}
 
-	// Find the first </prop> after the href.
+	injection := strings.Join(props, "")
+
+	// Try to inject into an existing 200 propstat's <prop>.
 	propCloseIdx := strings.Index(xmlBody[hrefIdx:], "</prop>")
-	if propCloseIdx < 0 {
+	if propCloseIdx >= 0 {
+		insertAt := hrefIdx + propCloseIdx
+		return xmlBody[:insertAt] + injection + xmlBody[insertAt:]
+	}
+
+	// No <prop> found — build a propstat block and inject before </response>.
+	respCloseIdx := strings.Index(xmlBody[hrefIdx:], "</response>")
+	if respCloseIdx < 0 {
 		return xmlBody
 	}
-	insertAt := hrefIdx + propCloseIdx
-	return xmlBody[:insertAt] + syncTokenWithValue + xmlBody[insertAt:]
+	insertAt := hrefIdx + respCloseIdx
+	propstat := `<propstat xmlns="DAV:"><prop>` + injection + `</prop><status>HTTP/1.1 200 OK</status></propstat>`
+	return xmlBody[:insertAt] + propstat + xmlBody[insertAt:]
 }

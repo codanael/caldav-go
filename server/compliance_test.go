@@ -954,3 +954,145 @@ func TestCompliance_PropFindSyncToken(t *testing.T) {
 		t.Errorf("expected sync-token value in PROPFIND response, got:\n%s", bodyStr)
 	}
 }
+
+// TestCompliance_PropFind_GetCTag tests that PROPFIND returns CS:getctag.
+func TestCompliance_PropFind_GetCTag(t *testing.T) {
+	ts, client := setupCompliance(t)
+	ctx := context.Background()
+	calPath := "/testuser/calendars/ctag1/"
+	createCalendar(t, ts.URL, calPath)
+
+	start := time.Date(2026, 12, 5, 10, 0, 0, 0, time.UTC)
+	end := time.Date(2026, 12, 5, 11, 0, 0, 0, time.UTC)
+	_, err := client.PutCalendarObject(ctx, calPath+"event-1.ics", makeTestEvent("ev1", "Event", start, end))
+	if err != nil {
+		t.Fatalf("put event: %v", err)
+	}
+
+	propfindBody := `<?xml version="1.0" encoding="UTF-8"?>
+<propfind xmlns="DAV:" xmlns:CS="http://calendarserver.org/ns/">
+  <prop>
+    <CS:getctag/>
+  </prop>
+</propfind>`
+
+	req, _ := http.NewRequest("PROPFIND", ts.URL+calPath, strings.NewReader(propfindBody))
+	req.SetBasicAuth("testuser", "testpass")
+	req.Header.Set("Content-Type", "application/xml")
+	req.Header.Set("Depth", "0")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("PROPFIND: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusMultiStatus {
+		t.Fatalf("expected 207, got %d: %s", resp.StatusCode, body)
+	}
+
+	bodyStr := string(body)
+	if !strings.Contains(bodyStr, "getctag") {
+		t.Errorf("expected getctag in PROPFIND response, got:\n%s", bodyStr)
+	}
+	if !strings.Contains(bodyStr, "sync-token-") {
+		t.Errorf("expected getctag value (sync-token-*) in response, got:\n%s", bodyStr)
+	}
+}
+
+// TestCompliance_PropFind_SupportedReportSet tests supported-report-set advertisement.
+func TestCompliance_PropFind_SupportedReportSet(t *testing.T) {
+	ts, _ := setupCompliance(t)
+	calPath := "/testuser/calendars/reports1/"
+	createCalendar(t, ts.URL, calPath)
+
+	propfindBody := `<?xml version="1.0" encoding="UTF-8"?>
+<propfind xmlns="DAV:">
+  <prop>
+    <supported-report-set/>
+  </prop>
+</propfind>`
+
+	req, _ := http.NewRequest("PROPFIND", ts.URL+calPath, strings.NewReader(propfindBody))
+	req.SetBasicAuth("testuser", "testpass")
+	req.Header.Set("Content-Type", "application/xml")
+	req.Header.Set("Depth", "0")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("PROPFIND: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusMultiStatus {
+		t.Fatalf("expected 207, got %d: %s", resp.StatusCode, body)
+	}
+
+	bodyStr := string(body)
+	if !strings.Contains(bodyStr, "supported-report-set") {
+		t.Errorf("expected supported-report-set in response, got:\n%s", bodyStr)
+	}
+	if !strings.Contains(bodyStr, "calendar-query") {
+		t.Errorf("expected calendar-query report, got:\n%s", bodyStr)
+	}
+	if !strings.Contains(bodyStr, "calendar-multiget") {
+		t.Errorf("expected calendar-multiget report, got:\n%s", bodyStr)
+	}
+	if !strings.Contains(bodyStr, "sync-collection") {
+		t.Errorf("expected sync-collection report, got:\n%s", bodyStr)
+	}
+}
+
+// TestCompliance_PropFind_CalendarColor tests X-APPLE-CALENDAR-COLOR in PROPFIND.
+func TestCompliance_PropFind_CalendarColor(t *testing.T) {
+	ts, _ := setupCompliance(t)
+	calPath := "/testuser/calendars/colored/"
+	createCalendar(t, ts.URL, calPath)
+
+	// Set color via PROPPATCH
+	proppatchBody := `<?xml version="1.0" encoding="UTF-8"?>
+<propertyupdate xmlns="DAV:" xmlns:A="http://apple.com/ns/ical/">
+  <set>
+    <prop>
+      <A:calendar-color>#FF5733</A:calendar-color>
+    </prop>
+  </set>
+</propertyupdate>`
+
+	req, _ := http.NewRequest("PROPPATCH", ts.URL+calPath, strings.NewReader(proppatchBody))
+	req.SetBasicAuth("testuser", "testpass")
+	req.Header.Set("Content-Type", "application/xml")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("PROPPATCH: %v", err)
+	}
+	resp.Body.Close()
+
+	// PROPFIND should return the color
+	propfindBody := `<?xml version="1.0" encoding="UTF-8"?>
+<propfind xmlns="DAV:" xmlns:A="http://apple.com/ns/ical/">
+  <prop>
+    <A:calendar-color/>
+  </prop>
+</propfind>`
+
+	req, _ = http.NewRequest("PROPFIND", ts.URL+calPath, strings.NewReader(propfindBody))
+	req.SetBasicAuth("testuser", "testpass")
+	req.Header.Set("Content-Type", "application/xml")
+	req.Header.Set("Depth", "0")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("PROPFIND: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusMultiStatus {
+		t.Fatalf("expected 207, got %d: %s", resp.StatusCode, body)
+	}
+
+	bodyStr := string(body)
+	if !strings.Contains(bodyStr, "#FF5733") {
+		t.Errorf("expected calendar color #FF5733 in response, got:\n%s", bodyStr)
+	}
+}
