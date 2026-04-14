@@ -52,6 +52,13 @@ type CalendarExtra struct {
 	Color string
 }
 
+// Delegation represents a calendar sharing delegation.
+type Delegation struct {
+	OwnerID    string
+	DelegateID string
+	Write      bool // true = read-write, false = read-only
+}
+
 // ExtendedBackend extends caldav.Backend with PROPPATCH and calendar deletion.
 type ExtendedBackend interface {
 	SyncBackend
@@ -64,4 +71,18 @@ type ExtendedBackend interface {
 
 	// GetCalendarExtra returns extended properties for a calendar.
 	GetCalendarExtra(ctx context.Context, path string) (*CalendarExtra, error)
+
+	// AddDelegation grants a delegate access to an owner's calendars.
+	AddDelegation(ctx context.Context, d Delegation) error
+
+	// RemoveDelegation revokes a delegate's access.
+	RemoveDelegation(ctx context.Context, ownerID, delegateID string) error
+
+	// GetDelegatesFor returns users who have delegated access to the given user.
+	// Returns (read-only principals, read-write principals).
+	GetDelegatesFor(ctx context.Context, userID string) (readFrom []string, writeFrom []string, err error)
+
+	// GetDelegatesOf returns users the given user has delegated access to.
+	// Returns (read-only delegates, read-write delegates).
+	GetDelegatesOf(ctx context.Context, userID string) (readTo []string, writeTo []string, err error)
 }

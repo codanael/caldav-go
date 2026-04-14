@@ -50,6 +50,10 @@ func newExtendedHandler(eb storage.ExtendedBackend, inner http.Handler, logger *
 				handlePropFindCalendar(w, r, eb, inner, logger)
 				return
 			}
+			if isPrincipalPath(r.URL.Path) {
+				handlePropFindPrincipal(w, r, eb, inner, logger)
+				return
+			}
 		case "REPORT":
 			bodyBytes, err := io.ReadAll(r.Body)
 			if err != nil {
@@ -69,6 +73,70 @@ func newExtendedHandler(eb storage.ExtendedBackend, inner http.Handler, logger *
 
 		inner.ServeHTTP(w, r)
 	})
+}
+
+// isPrincipalPath returns true if the path looks like a user principal (1 segment: /{user}/).
+func isPrincipalPath(path string) bool {
+	return resourceLevel(path) == 1
+}
+
+// --- PROPFIND principal with scheduling URLs ---
+
+func handlePropFindPrincipal(w http.ResponseWriter, r *http.Request, eb storage.ExtendedBackend, inner http.Handler, logger *slog.Logger) {
+	rec := &propfindResponseWriter{ResponseWriter: w}
+	inner.ServeHTTP(rec, r)
+
+	if !rec.hijacked {
+		return
+	}
+
+	body := rec.buf.String()
+
+	// Remove 404 propstat blocks for properties we'll provide.
+	body = remove404PropstatBlock(body, "schedule-inbox-URL")
+	body = remove404PropstatBlock(body, "schedule-outbox-URL")
+	body = remove404PropstatBlock(body, "calendar-user-address-set")
+	body = remove404PropstatBlock(body, "calendar-proxy-read-for")
+	body = remove404PropstatBlock(body, "calendar-proxy-write-for")
+
+	// Extract user from path: /{user}/ -> user
+	userID := strings.TrimPrefix(r.URL.Path, "/")
+	userID = strings.TrimSuffix(userID, "/")
+
+	var propsToInject []string
+
+	// Scheduling inbox/outbox (RFC 6638)
+	propsToInject = append(propsToInject,
+		fmt.Sprintf(`<schedule-inbox-URL xmlns="urn:ietf:params:xml:ns:caldav"><href xmlns="DAV:">/%s/inbox/</href></schedule-inbox-URL>`, userID),
+		fmt.Sprintf(`<schedule-outbox-URL xmlns="urn:ietf:params:xml:ns:caldav"><href xmlns="DAV:">/%s/outbox/</href></schedule-outbox-URL>`, userID),
+		fmt.Sprintf(`<calendar-user-address-set xmlns="urn:ietf:params:xml:ns:caldav"><href xmlns="DAV:">mailto:%s</href></calendar-user-address-set>`, userID),
+	)
+
+	// Calendar proxy delegation
+	readFrom, writeFrom, err := eb.GetDelegatesFor(r.Context(), userID)
+	if err == nil {
+		// calendar-proxy-read-for: principals whose calendars we can read
+		readForXML := `<calendar-proxy-read-for xmlns="http://calendarserver.org/ns/">`
+		for _, owner := range readFrom {
+			readForXML += fmt.Sprintf(`<href xmlns="DAV:">/%s/</href>`, owner)
+		}
+		readForXML += `</calendar-proxy-read-for>`
+		propsToInject = append(propsToInject, readForXML)
+
+		// calendar-proxy-write-for: principals whose calendars we can write
+		writeForXML := `<calendar-proxy-write-for xmlns="http://calendarserver.org/ns/">`
+		for _, owner := range writeFrom {
+			writeForXML += fmt.Sprintf(`<href xmlns="DAV:">/%s/</href>`, owner)
+		}
+		writeForXML += `</calendar-proxy-write-for>`
+		propsToInject = append(propsToInject, writeForXML)
+	}
+
+	body = injectIntoProps(body, r.URL.Path, propsToInject)
+
+	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+	w.WriteHeader(http.StatusMultiStatus)
+	fmt.Fprint(w, body)
 }
 
 // --- PROPPATCH ---

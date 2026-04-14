@@ -773,3 +773,81 @@ func (b *Backend) SyncCollection(ctx context.Context, calendarPath string, syncT
 	}
 	return resp, nil
 }
+
+// AddDelegation grants a delegate access to an owner's calendars.
+func (b *Backend) AddDelegation(ctx context.Context, d storage.Delegation) error {
+	writeAccess := 0
+	if d.Write {
+		writeAccess = 1
+	}
+	_, err := b.db.ExecContext(ctx,
+		`INSERT OR REPLACE INTO delegations (owner_id, delegate_id, write_access) VALUES (?, ?, ?)`,
+		d.OwnerID, d.DelegateID, writeAccess,
+	)
+	if err != nil {
+		return fmt.Errorf("sqlite: add delegation: %w", err)
+	}
+	return nil
+}
+
+// RemoveDelegation revokes a delegate's access.
+func (b *Backend) RemoveDelegation(ctx context.Context, ownerID, delegateID string) error {
+	_, err := b.db.ExecContext(ctx,
+		`DELETE FROM delegations WHERE owner_id = ? AND delegate_id = ?`,
+		ownerID, delegateID,
+	)
+	if err != nil {
+		return fmt.Errorf("sqlite: remove delegation: %w", err)
+	}
+	return nil
+}
+
+// GetDelegatesFor returns users who have delegated access TO the given user.
+func (b *Backend) GetDelegatesFor(ctx context.Context, userID string) (readFrom []string, writeFrom []string, err error) {
+	rows, err := b.db.QueryContext(ctx,
+		`SELECT owner_id, write_access FROM delegations WHERE delegate_id = ?`, userID,
+	)
+	if err != nil {
+		return nil, nil, fmt.Errorf("sqlite: get delegates for: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var ownerID string
+		var writeAccess int
+		if err := rows.Scan(&ownerID, &writeAccess); err != nil {
+			return nil, nil, fmt.Errorf("sqlite: scan delegation: %w", err)
+		}
+		if writeAccess == 1 {
+			writeFrom = append(writeFrom, ownerID)
+		} else {
+			readFrom = append(readFrom, ownerID)
+		}
+	}
+	return readFrom, writeFrom, rows.Err()
+}
+
+// GetDelegatesOf returns users the given user has delegated access to.
+func (b *Backend) GetDelegatesOf(ctx context.Context, userID string) (readTo []string, writeTo []string, err error) {
+	rows, err := b.db.QueryContext(ctx,
+		`SELECT delegate_id, write_access FROM delegations WHERE owner_id = ?`, userID,
+	)
+	if err != nil {
+		return nil, nil, fmt.Errorf("sqlite: get delegates of: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var delegateID string
+		var writeAccess int
+		if err := rows.Scan(&delegateID, &writeAccess); err != nil {
+			return nil, nil, fmt.Errorf("sqlite: scan delegation: %w", err)
+		}
+		if writeAccess == 1 {
+			writeTo = append(writeTo, delegateID)
+		} else {
+			readTo = append(readTo, delegateID)
+		}
+	}
+	return readTo, writeTo, rows.Err()
+}

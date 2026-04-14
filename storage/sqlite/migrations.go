@@ -41,6 +41,17 @@ CREATE TABLE IF NOT EXISTS sync_changes (
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS delegations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_id TEXT NOT NULL,
+    delegate_id TEXT NOT NULL,
+    write_access INTEGER NOT NULL DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(owner_id, delegate_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_delegations_owner ON delegations(owner_id);
+CREATE INDEX IF NOT EXISTS idx_delegations_delegate ON delegations(delegate_id);
 CREATE INDEX IF NOT EXISTS idx_calendars_user ON calendars(user_id);
 CREATE INDEX IF NOT EXISTS idx_objects_calendar ON calendar_objects(calendar_id);
 CREATE INDEX IF NOT EXISTS idx_objects_comp ON calendar_objects(calendar_id, comp_type);

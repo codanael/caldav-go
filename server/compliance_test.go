@@ -13,6 +13,7 @@ import (
 	"encoding/xml"
 
 	"github.com/codanael/caldav-go/auth"
+	"github.com/codanael/caldav-go/storage"
 	"github.com/codanael/caldav-go/storage/sqlite"
 	"github.com/emersion/go-ical"
 	"github.com/emersion/go-webdav/caldav"
@@ -1094,5 +1095,130 @@ func TestCompliance_PropFind_CalendarColor(t *testing.T) {
 	bodyStr := string(body)
 	if !strings.Contains(bodyStr, "#FF5733") {
 		t.Errorf("expected calendar color #FF5733 in response, got:\n%s", bodyStr)
+	}
+}
+
+// TestCompliance_PropFind_SchedulingURLs tests schedule-inbox-URL and schedule-outbox-URL.
+func TestCompliance_PropFind_SchedulingURLs(t *testing.T) {
+	ts, _ := setupCompliance(t)
+
+	propfindBody := `<?xml version="1.0" encoding="UTF-8"?>
+<propfind xmlns="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <prop>
+    <C:schedule-inbox-URL/>
+    <C:schedule-outbox-URL/>
+    <C:calendar-user-address-set/>
+  </prop>
+</propfind>`
+
+	req, _ := http.NewRequest("PROPFIND", ts.URL+"/testuser/", strings.NewReader(propfindBody))
+	req.SetBasicAuth("testuser", "testpass")
+	req.Header.Set("Content-Type", "application/xml")
+	req.Header.Set("Depth", "0")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("PROPFIND: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusMultiStatus {
+		t.Fatalf("expected 207, got %d: %s", resp.StatusCode, body)
+	}
+
+	bodyStr := string(body)
+	if !strings.Contains(bodyStr, "/testuser/inbox/") {
+		t.Errorf("expected schedule-inbox-URL with /testuser/inbox/, got:\n%s", bodyStr)
+	}
+	if !strings.Contains(bodyStr, "/testuser/outbox/") {
+		t.Errorf("expected schedule-outbox-URL with /testuser/outbox/, got:\n%s", bodyStr)
+	}
+	if !strings.Contains(bodyStr, "mailto:testuser") {
+		t.Errorf("expected calendar-user-address-set with mailto:testuser, got:\n%s", bodyStr)
+	}
+}
+
+// TestCompliance_Delegation tests calendar proxy delegation.
+func TestCompliance_Delegation(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "delegation.db")
+	backend, err := sqlite.New(dbPath)
+	if err != nil {
+		t.Fatalf("sqlite.New: %v", err)
+	}
+	t.Cleanup(func() { backend.Close() })
+
+	authProvider := auth.NewBasicProvider()
+	for _, u := range []struct{ name, pass string }{
+		{"alice", "alicepass"},
+		{"bob", "bobpass"},
+	} {
+		if err := authProvider.AddUser(u.name, u.pass, auth.User{
+			ID: u.name, DisplayName: u.name, Email: u.name + "@example.com",
+		}); err != nil {
+			t.Fatalf("AddUser(%s): %v", u.name, err)
+		}
+	}
+
+	handler := New(WithBackend(backend), WithAuth(authProvider))
+	ts := httptest.NewServer(handler)
+	t.Cleanup(ts.Close)
+
+	// Alice delegates read access to Bob
+	err = backend.AddDelegation(context.Background(), storage.Delegation{
+		OwnerID: "alice", DelegateID: "bob", Write: false,
+	})
+	if err != nil {
+		t.Fatalf("AddDelegation: %v", err)
+	}
+
+	// Bob's PROPFIND should show alice in calendar-proxy-read-for
+	propfindBody := `<?xml version="1.0" encoding="UTF-8"?>
+<propfind xmlns="DAV:" xmlns:CS="http://calendarserver.org/ns/">
+  <prop>
+    <CS:calendar-proxy-read-for/>
+    <CS:calendar-proxy-write-for/>
+  </prop>
+</propfind>`
+
+	req, _ := http.NewRequest("PROPFIND", ts.URL+"/bob/", strings.NewReader(propfindBody))
+	req.SetBasicAuth("bob", "bobpass")
+	req.Header.Set("Content-Type", "application/xml")
+	req.Header.Set("Depth", "0")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("PROPFIND: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusMultiStatus {
+		t.Fatalf("expected 207, got %d: %s", resp.StatusCode, body)
+	}
+
+	bodyStr := string(body)
+	if !strings.Contains(bodyStr, "/alice/") {
+		t.Errorf("expected /alice/ in calendar-proxy-read-for, got:\n%s", bodyStr)
+	}
+
+	// Remove delegation
+	if err := backend.RemoveDelegation(context.Background(), "alice", "bob"); err != nil {
+		t.Fatalf("RemoveDelegation: %v", err)
+	}
+
+	// Bob's PROPFIND should no longer show alice
+	req, _ = http.NewRequest("PROPFIND", ts.URL+"/bob/", strings.NewReader(propfindBody))
+	req.SetBasicAuth("bob", "bobpass")
+	req.Header.Set("Content-Type", "application/xml")
+	req.Header.Set("Depth", "0")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("PROPFIND after removal: %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	bodyStr = string(body)
+	if strings.Contains(bodyStr, "/alice/") {
+		t.Errorf("expected /alice/ to be gone after delegation removal, got:\n%s", bodyStr)
 	}
 }
