@@ -13,6 +13,7 @@ type Config struct {
 	ListenAddr string    `yaml:"listen_addr"`
 	BasePath   string    `yaml:"base_path"`
 	TLS        TLSConfig `yaml:"tls"`
+	DBDriver   string    `yaml:"db_driver"`
 	DBPath     string    `yaml:"db_path"`
 	Auth       AuthConfig `yaml:"auth"`
 	LogLevel   string    `yaml:"log_level"`
@@ -55,6 +56,7 @@ func DefaultConfig() *Config {
 	return &Config{
 		ListenAddr: ":8080",
 		BasePath:   "/",
+		DBDriver:   "sqlite",
 		DBPath:     "./caldav.db",
 		LogLevel:   "info",
 		Auth: AuthConfig{
@@ -77,7 +79,8 @@ func Load(configPath string, args []string) (*Config, error) {
 	fs := flag.NewFlagSet("caldav", flag.ContinueOnError)
 
 	flagListen := fs.String("listen", "", "listen address")
-	flagDBPath := fs.String("db-path", "", "database path")
+	flagDBDriver := fs.String("db-driver", "", "database driver (sqlite or postgres)")
+	flagDBPath := fs.String("db-path", "", "database path or connection string")
 	flagBasePath := fs.String("base-path", "", "base URL path")
 	flagLogLevel := fs.String("log-level", "", "log level")
 	flagConfig := fs.String("config", "", "config file path")
@@ -116,6 +119,8 @@ func Load(configPath string, args []string) (*Config, error) {
 		switch f.Name {
 		case "listen":
 			cfg.ListenAddr = *flagListen
+		case "db-driver":
+			cfg.DBDriver = *flagDBDriver
 		case "db-path":
 			cfg.DBPath = *flagDBPath
 		case "base-path":
@@ -144,6 +149,9 @@ func Load(configPath string, args []string) (*Config, error) {
 func applyEnv(cfg *Config) {
 	if v := os.Getenv("CALDAV_LISTEN_ADDR"); v != "" {
 		cfg.ListenAddr = v
+	}
+	if v := os.Getenv("CALDAV_DB_DRIVER"); v != "" {
+		cfg.DBDriver = v
 	}
 	if v := os.Getenv("CALDAV_DB_PATH"); v != "" {
 		cfg.DBPath = v
